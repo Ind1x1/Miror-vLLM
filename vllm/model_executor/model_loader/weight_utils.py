@@ -620,7 +620,23 @@ def default_weight_loader(param: torch.Tensor,
         # debug weight loading issues.
         raise
 
-
+def default_grad_syncer(param: torch.Tensor,
+                        synced_grad: torch.Tensor) -> None:
+    """Default grad loader."""
+    try:
+        if param.numel() == 1 and synced_grad.numel() == 1:
+            if param.grad is None:
+                param.grad = torch.zeros_like(param.data)
+            param.grad.fill_(synced_grad.item())
+        else:
+            assert param.grad.shape == synced_grad.shape, (
+                f"Attempted to load grad ({synced_grad.shape}) "
+                f"into parameter ({param.grad.shape})")
+            param.grad.copy_(synced_grad)
+    except Exception:
+        # OPTIMIZE: TP parallel seem dontbe updated
+        raise
+    
 def row_parallel_weight_loader(param: torch.Tensor,
                                loaded_weight: torch.Tensor) -> None:
     """Load weights that are row-parallelized."""

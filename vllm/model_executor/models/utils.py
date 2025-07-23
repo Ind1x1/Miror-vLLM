@@ -13,7 +13,7 @@ from transformers import PretrainedConfig
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader, default_grad_loader
 from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (get_cuda_view_from_cpu_tensor, is_pin_memory_available,
@@ -23,6 +23,53 @@ logger = init_logger(__name__)
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+GradsMapping = Mapping[str, Optional[str]]
+"""If a key maps to a value of `None`, the corresponding grad is ignored."""
+
+"""
+    GradsMapper is used to map the name of each grad if they match the following patterns.
+    It is used to map the name of each grad to a new name.
+    If a key maps to a value of `None`, the corresponding grad is ignored.
+    处理 vllm 和 模型 映射不同的问题，比如 vllm 的 grad 是 decoder.xxx.xxx.xxx 而模型是 model.xxx.xxx.xxx.xxx
+"""
+@dataclass 
+class GradsMapper:
+    """Maps the name of eache weight if they match the following patterns."""
+
+    orig_to_new_substr: GradsMapping = field(default_factory=dict)
+    orig_to_new_prefix: GradsMapping = field(default_factory=dict)
+    orig_to_new_suffix: GradsMapping = field(default_factory=dict)
+
+    def _map_name(self, key: str) -> Optional[str]:
+        for substr, new_key in self.orig_to_new_substr.items():
+            if substr in key:
+                if new_key is None:
+                    return None
+
+                key = key.replace(substr, new_key, 1)
+
+        for prefix, new_key in self.orig_to_new_prefix.items():
+            if key.startswith(prefix):
+                if new_key is None:
+                    return None
+
+                key = key.replace(prefix, new_key, 1)
+
+        for suffix, new_key in self.orig_to_new_suffix.items():
+            if key.endswith(suffix):
+                if new_key is None:
+                    return None
+
+                key = new_key.join(key.rsplit(suffix, 1))
+
+        return key
+
+    def apply(
+        self, grads: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        return ((out_name, data) for name, data in grads
+                if (out_name := self._map_name(name)) is not None)
 
 
 @dataclass
@@ -105,6 +152,17 @@ class AutoWeightsLoader:
         # update default skip_substrs
         self.skip_substrs += self.ROTARY_EMBEDS_UNUSED_WEIGHTS
 
+    """
+    weights = [
+        ("layer1.weight", tensor1),
+        ("layer1.bias", tensor2),
+        ("layer2.weight", tensor3),
+        ("bias", tensor4),
+    ]
+    # "layer1": [("weight", tensor1), ("bias", tensor2)]
+    # "layer2": [("weight", tensor3)]
+    # "bias": [("", tensor4)]
+    """
     def _groupby_prefix(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -122,6 +180,7 @@ class AutoWeightsLoader:
                  for parts, weights_data in group),
             )
 
+    # 拼接
     def _get_qualname(self, prefix: str, rest: str) -> str:
         if prefix == "":
             return rest
@@ -276,7 +335,172 @@ class AutoWeightsLoader:
 
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
+    
+class AutoGradsSyncer:
+    """
+    Helper class to sync grads into a [`torch.nn.Module`][]. It is able
+    to automatically detect child modules and parameters while iterating over
+    the grads only once.
+    """
+    ROTARY_EMBEDS_UNUSED_WEIGHTS = [
+        "rotary_emb.inv_freq",
+        "rotary_emb.cos_cached",
+        "rotary_emb.sin_cached",
+    ]
 
+    def __init__(
+        self,
+        module: nn.Module,
+        *,
+        skip_prefixes: Optional[list[str]] = None,
+        skip_substrs: Optional[list[str]] = None,
+        ignore_unexpected_prefixes: Optional[list[str]] = None,
+    ) -> None:
+        super().__init__()
+
+        self.module = module
+        self.skip_prefixes = skip_prefixes or []
+        self.skip_substrs = skip_substrs or []
+        self.ignore_unexpected_prefixes = ignore_unexpected_prefixes or []
+        # update default skip_substrs
+        self.skip_substrs += self.ROTARY_EMBEDS_UNUSED_WEIGHTS
+
+    def _groupby_prefix(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, Iterable[tuple[str, torch.Tensor]]]]:
+        weights_by_parts = ((weight_name.split(".", 1), weight_data)
+                            for weight_name, weight_data in weights)
+
+        for prefix, group in itertools.groupby(weights_by_parts,
+                                               key=lambda x: x[0][0]):
+            yield (
+                prefix,
+                # Because maxsplit=1 in weight_name.split(...),
+                # the length of `parts` must either be 1 or 2
+                (("" if len(parts) == 1 else parts[1], weights_data)
+                 for parts, weights_data in group),
+            )
+
+    def _get_qualname(self, prefix: str, rest: str) -> str:
+        if prefix == "":
+            return rest
+        if rest == "":
+            return prefix
+
+        return ".".join((prefix, rest))
+    
+    def _can_skip(self, qualname: str) -> bool:
+        return (any(qualname.startswith(p) for p in self.skip_prefixes)
+                or any(substr in qualname for substr in self.skip_substrs))
+
+    def _can_ignore_unexpected(self, qualname: str) -> bool:
+        return any(
+            qualname.startswith(p) for p in self.ignore_unexpected_prefixes)
+    
+    def _sync_grad(
+        self,
+        base_prefix: str,
+        param: nn.Parameter,
+        grads: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[str]:
+        for grad_name, grad_data in grads:
+            grad_qualname = self._get_qualname(base_prefix, grad_name)
+
+            if self._can_skip(grad_qualname):
+                continue
+            if grad_name != "":
+                if self._can_ignore_unexpected(grad_qualname):
+                    logger.debug("Ignoring grad %s", grad_qualname)
+                    continue
+
+                raise ValueError(
+                    f"Attempted to load nested grad '{grad_qualname}' "
+                    f"into a single parameter '{base_prefix}'")
+
+            grad_loader = getattr(param, "grad_loader", default_grad_loader)
+            grad_loader(param, grad_data)
+
+            logger.debug("Loaded grad %s with shape %s", grad_qualname,
+                         param.shape)
+            
+            yield grad_qualname
+            
+
+    def _sync_module(
+        self,
+        base_prefix: str,
+        module: nn.Module,
+        grads: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[str]:
+        if isinstance(module, PPMissingLayer):
+            return
+        
+        if module != self.module:
+            module_sync_grads = getattr(module, "sync_grads", None)
+            if callable(module_sync_grads):
+                synced_params = module_sync_grads(grads)
+                if synced_params is None:
+                    logger.warning(
+                        "Unable to collect synced parameters "
+                        "for module %s", module)
+                else:
+                    yield from map(
+                        lambda x: self._get_qualname(base_prefix, x),
+                        synced_params,
+                    )
+        
+        child_modules = dict(module.named_children())
+        child_params = dict(module.named_parameters(recurse=False))
+
+        for child_prefix, child_grads in self._groupby_prefix(grads):
+            prefix = self._get_qualname(base_prefix, child_prefix)
+            if child_prefix in child_modules:
+                if self._can_skip(prefix + "."):
+                    logger.debug("Skipping module %s", prefix)
+                    continue
+                
+                yield from self._sync_module(prefix,
+                                             child_modules[child_prefix],
+                                             child_grads)
+            elif child_prefix in child_params:
+                if self._can_skip(prefix):
+                    logger.debug("Skipping param %s", prefix)
+                    continue
+                yield from self._sync_grad(prefix,
+                                           child_params[child_prefix],
+                                           child_grads)
+            else:
+                can_skip_module = self._can_skip(prefix + ".")
+                can_skip_param = self._can_skip(prefix)
+                if can_skip_module or can_skip_param:
+                    logger.debug("Skipping missing %s", prefix)
+                    continue
+                
+                can_ignore_module = self._can_ignore_unexpected(prefix + ".")
+                can_ignore_param = self._can_ignore_unexpected(prefix)
+                if can_ignore_module or can_ignore_param:
+                    logger.debug("Ignoring missing %s", prefix)
+                    continue
+
+                msg = (f"There is no module or parameter named '{prefix}' "
+                       f"in {type(self.module).__name__}")
+                raise ValueError(msg)
+
+    def sync_grads(
+        self,
+        grads: Iterable[tuple[str, torch.Tensor]],
+        *,
+        mapper: Optional[GradsMapper] = None,
+    ) -> set[str]:
+        if mapper is not None:
+            grads = mapper.apply(grads)
+        # filter out grads with first-prefix/substr to skip in name
+        grads = ((name, grad) for name, grad in grads
+                 if not self._can_skip(name))
+        
+        autosynced_grads = set(self._sync_module("", self.module, grads))
+        return autosynced_grads
 
 def init_vllm_registered_model(
     vllm_config: VllmConfig,

@@ -430,6 +430,30 @@ class VocabParallelEmbedding(torch.nn.Module):
         s += f', num_embeddings_padded={self.num_embeddings_padded}'
         s += f', tp_size={self.tp_size}'
         return s
+    
+    def grad_syncer(self, param: Parameter, synced_grad: torch.Tensor):
+        output_dim = getattr(param, "output_dim", None)
+        packed_dim = getattr(param, "packed_dim", None)
+
+        start_idx = self.shard_indices.org_vocab_start_index
+        shard_size = self.shard_indices.org_vocab_end_index - start_idx
+
+        if packed_dim is not None and packed_dim == output_dim:
+            packed_factor = param.packed_factor if isinstance(
+                param, BasevLLMParameter) else param.pack_factor
+            assert synced_grad.shape[output_dim] == (self.org_vocab_size //
+                                                     param.packed_factor)
+            start_idx = start_idx // packed_factor
+            shard_size = shard_size // packed_factor
+        else:
+            assert synced_grad.shape[output_dim] == self.org_vocab_size
+
+        synced_grad = synced_grad.narrow(output_dim, start_idx, shard_size)
+
+        if param.grad is None:
+            param.grad = torch.zeros_like(param.data)
+        param.grad[:synced_grad.shape[0]].copy_(synced_grad)
+        param.grad[synced_grad.shape[0]:].fill_(0)
 
 
 class ParallelLMHead(VocabParallelEmbedding):

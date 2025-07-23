@@ -779,6 +779,47 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                                         shard_id=loaded_shard_id,
                                         shard_offset=shard_offset,
                                         shard_size=shard_size)
+        
+    def grad_syncer(self,
+                     param: Parameter,
+                     synced_grad: torch.Tensor,
+                     loaded_shard_id: Optional[int] = None):
+    
+        if param.grad is None:
+            param.grad = torch.zeros_like(param.data)
+        param_grad = param.grad
+        output_dim = getattr(param, "output_dim", None)
+
+        assert loaded_shard_id < len(self.output_sizes)
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        if output_dim is not None:
+            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
+            shard_size = self.output_sizes[loaded_shard_id] // tp_size
+            packed_dim = getattr(param, "packed_dim", None)
+            if packed_dim == output_dim:
+                shard_size = shard_size // param.pack_factor
+                shard_offset = shard_offset // param.pack_factor
+                # Special case for Marlin.
+                shard_size, shard_offset = adjust_marlin_shard(
+                    param, shard_size, shard_offset)
+            shard_size, shard_offset = adjust_bitblas_shard(
+                param, shard_size, shard_offset)
+
+            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit",
+                                            False)
+            is_sharded_weight = getattr(param, "is_sharded_weight", False)
+            is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+            assert not use_bitsandbytes_4bit, "Bitsandbytes 4bit is not supported for grads syncer"
+
+            param_grad = param.grad.narrow(output_dim, shard_offset, shard_size)
+            start_idx = tp_rank * shard_size
+            if not is_sharded_weight:
+                synced_grad = synced_grad.narrow(output_dim, start_idx, shard_size)
+
+        assert param_grad.shape == synced_grad.shape
+        param_grad.copy_(synced_grad)        
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -1130,6 +1171,52 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
+    def grad_syncer(self,
+                     param: Parameter,
+                     synced_grad: torch.Tensor,
+                     loaded_shard_id: Optional[str] = None):
+        
+        if param.grad is None:
+            param_grad = torch.zeros_like(param.data)
+        output_dim = getattr(param, "output_dim", None)
+
+        tp_rank = get_tensor_model_parallel_rank()
+        assert loaded_shard_id in ["q", "k", "v"]
+
+        if output_dim is not None:
+            if loaded_shard_id == "q":
+                shard_offset = 0
+                shard_size = self.num_heads * self.head_size
+            elif loaded_shard_id == "k":
+                shard_offset = self.num_heads * self.head_size
+                shard_size = self.num_kv_heads * self.head_size
+            elif loaded_shard_id == "v":
+                shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size
+                shard_size = self.num_kv_heads * self.head_size
+            packed_dim = getattr(param, "packed_dim", None)
+            if packed_dim == output_dim:
+                shard_size = shard_size // param.pack_factor
+                shard_offset = shard_offset // param.pack_factor
+
+            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit",
+                                            False)
+            is_sharded_weight = getattr(param, "is_sharded_weight", False)
+            is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+            assert not use_bitsandbytes_4bit, "Bitsandbytes 4bit is not supported for grads syncer"
+
+            param_grad = param_grad.narrow(output_dim, shard_offset, shard_size)
+            if loaded_shard_id == "q":
+                shard_id = tp_rank
+            else:
+                shard_id = tp_rank // self.num_kv_head_replicas
+            start_idx = shard_id * shard_size
+
+            if not is_sharded_weight:
+                synced_grad = synced_grad.narrow(output_dim, start_idx, shard_size)
+
+        assert param_grad.shape == synced_grad.shape
+        param_grad.copy_(synced_grad)
 
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
@@ -1306,6 +1393,28 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
+    
+    def grad_syncer(self, param: Parameter, synced_grad: torch.Tensor):
+        tp_rank = get_tensor_model_parallel_rank()
+        input_dim = getattr(param, "input_dim", None)
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+        if param.grad is None:
+            param.grad = torch.zeros_like(param.data)
+        param_grad = param.grad
+
+        if input_dim is not None and not is_sharded_weight:
+            shard_size = param_grad.shape[input_dim]
+            start_idx = tp_rank * shard_size
+            synced_grad = synced_grad.narrow(input_dim, start_idx, shard_size)
+
+        if len(synced_grad.shape) == 0:
+            synced_grad = synced_grad.reshape(1)
+
+        assert param_grad.shape == synced_grad.shape
+        param_grad.copy_(synced_grad)
 
 
 class QKVCrossParallelLinear(LinearBase):
