@@ -629,9 +629,11 @@ def default_grad_syncer(param: torch.Tensor,
                 param.grad = torch.zeros_like(param.data)
             param.grad.fill_(synced_grad.item())
         else:
-            assert param.grad.shape == synced_grad.shape, (
-                f"Attempted to load grad ({synced_grad.shape}) "
-                f"into parameter ({param.grad.shape})")
+            if param.grad is None:
+                param.grad = torch.zeros_like(param.data)
+            assert param.grad.size() == synced_grad.size(), (
+                f"Attempted to load grad ({synced_grad.size()}) "
+                f"into parameter ({param.grad.size()})")
             param.grad.copy_(synced_grad)
     except Exception:
         # OPTIMIZE: TP parallel seem dontbe updated

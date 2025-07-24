@@ -416,7 +416,8 @@ class ColumnParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader),
+            grad_syncer=self.grad_syncer)
         if bias:
             self.bias = Parameter(
                 torch.empty(self.output_size_per_partition,
@@ -424,9 +425,13 @@ class ColumnParallelLinear(LinearBase):
             set_weight_attrs(self.bias, {
                 "output_dim": 0,
                 "weight_loader": self.weight_loader,
+                "grad_syncer": self.grad_syncer,
             })
         else:
             self.register_parameter("bias", None)
+
+    def grad_syncer(self, param: Parameter, synced_grad: torch.Tensor):
+        pass
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
@@ -1032,7 +1037,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv).
+            # Loaded weight is already fused on disk (MergedColumnParallelLinear).
             # (e.g., Phi-3's qkv_proj).
             if output_dim is None:
                 if needs_scalar_to_array:
@@ -1292,7 +1297,8 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader),
+            grad_syncer=self.grad_syncer)
         if not reduce_results and (bias and not skip_bias_add):
             raise ValueError("When not reduce the results, adding bias to the "
                              "results can lead to incorrect results")
@@ -1303,6 +1309,7 @@ class RowParallelLinear(LinearBase):
             set_weight_attrs(self.bias, {
                 "output_dim": 0,
                 "weight_loader": self.weight_loader,
+                "grad_syncer": self.grad_syncer,
             })
         else:
             self.register_parameter("bias", None)

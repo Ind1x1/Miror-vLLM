@@ -13,7 +13,7 @@ from transformers import PretrainedConfig
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader, default_grad_loader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader, default_grad_syncer
 from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (get_cuda_view_from_cpu_tensor, is_pin_memory_available,
@@ -418,7 +418,7 @@ class AutoGradsSyncer:
                     f"Attempted to load nested grad '{grad_qualname}' "
                     f"into a single parameter '{base_prefix}'")
 
-            grad_loader = getattr(param, "grad_loader", default_grad_loader)
+            grad_loader = getattr(param, "grad_loader", default_grad_syncer)
             grad_loader(param, grad_data)
 
             logger.debug("Loaded grad %s with shape %s", grad_qualname,

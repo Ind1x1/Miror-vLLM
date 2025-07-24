@@ -268,7 +268,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                                          self.embedding_dim,
                                          self.num_embeddings_padded,
                                          params_dtype=params_dtype,
-                                         weight_loader=self.weight_loader)
+                                         weight_loader=self.weight_loader,
+                                         grad_syncer=self.grad_syncer)
 
     @classmethod
     def _get_indices(cls, vocab_size_padded: int, org_vocab_size_padded: int,

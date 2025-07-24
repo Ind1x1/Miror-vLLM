@@ -433,7 +433,7 @@ class Qwen2Model(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        synced_params = set[str] = set()
+        synced_params: set[str] = set()
         for name, synced_grad in grads:
             for (param_name, grad_name, shard_id) in stacked_params_mapping:
                 if grad_name not in name:
